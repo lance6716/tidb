@@ -1,7 +1,7 @@
 name: "Pull request labeler"
 on:
-  schedule:
-    - cron: '*/6 * * * *'
+  release:
+    
 jobs:
   labeler:
     runs-on: ubuntu-latest
