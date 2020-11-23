@@ -182,6 +182,73 @@ func (bq *brieQueue) registerTask(
 	return taskCtx, taskID, item, nil
 }
 
+func (bq *brieQueue) prepareResumeTask(
+	ctx context.Context,
+	info *brieTaskInfo,
+	s *sessionWithLock,
+	resumeId uint64,
+) (context.Context, uint64, *brieQueueItem, error) {
+	taskCtx, taskCancel := context.WithCancel(ctx)
+	item := &brieQueueItem{
+		info:   info,
+		cancel: taskCancel,
+		progress: &brieTaskProgress{
+			cmd:   "Wait",
+			total: 1,
+		},
+	}
+
+	sql := fmt.Sprintf(`SELECT kind, status
+			FROM mysql.brie_tasks WHERE id = %d`, resumeId)
+	s.Lock()
+	defer s.Unlock()
+	rs, err := s.Execute(ctx, sql)
+	if err != nil {
+		return nil, 0, item, err
+	}
+	r := rs[0]
+	defer terror.Call(r.Close)
+	req := r.NewChunk()
+	err = r.Next(taskCtx, req)
+	if err != nil {
+		return nil, 0, item, err
+	}
+	if req.NumRows() == 0 {
+		return nil, 0, item, errors.Errorf("task with ID %d not found", resumeId)
+	}
+
+	row := req.GetRow(0)
+	kind := row.GetString(0)
+	status := row.GetString(1)
+	if kind != ast.BRIEKindImport.String() {
+		return nil, 0, item, errors.Errorf("can only resume a IMPORT task, got %s", kind)
+	}
+	if status != "Stop" && status != "Finish" {
+		return nil, 0, item, errors.Errorf("can only resume a stop/finish task, got %s", status)
+	}
+
+	sql = fmt.Sprintf(`UPDATE mysql.brie_tasks SET
+				origin_sql = '%s', queue_time = '%s', data_path = '%s', conn_id = %d,
+				status = '%s', progress = %f, cancel = %d
+			WHERE id = %d`,
+		base64.StdEncoding.EncodeToString([]byte(info.originSQL)),
+		info.queueTime.String(),
+		base64.StdEncoding.EncodeToString([]byte(info.storage)),
+		info.connID,
+		item.progress.cmd,
+		item.progress.GetFraction(),
+		0,
+		resumeId,
+	)
+	_, err = s.Execute(ctx, sql)
+	if err != nil {
+		return nil, 0, item, err
+	}
+
+	return taskCtx, resumeId, item, nil
+	// TODO(lance6716): leave check for local SST to lightning
+}
+
 // acquireTask prepares to execute a BRIE task. Only one BRIE task can be
 // executed at a time, and this function blocks until the task is ready.
 func (bq *brieQueue) acquireTask(taskCtx context.Context, taskID uint64, se *sessionWithLock) (err error) {
@@ -466,6 +533,8 @@ func (b *executorBuilder) buildBRIE(s *ast.BRIEStmt, schema *expression.Schema) 
 				if opt.UintValue == 0 {
 					importGlobalCfg.PostRestore.Analyze = importcfg.OpLevelOff
 				}
+			case ast.BRIEOptionResume:
+				e.resumeId = opt.UintValue
 			}
 		}
 
@@ -485,6 +554,7 @@ type BRIEExec struct {
 	importGlobalCfg *importcfg.GlobalConfig
 	importTaskCfg   *importcfg.Config
 	info            *brieTaskInfo
+	resumeId        uint64 // since auto_increment_offset can't be set to 0, it's OK to use 0 to mark "not resume"
 }
 
 // sessionWithLock protects task session that may be concurrently used to change brie_tasks table
@@ -515,7 +585,17 @@ func (e *BRIEExec) Next(ctx context.Context, req *chunk.Chunk) error {
 	defer s.Close()
 	taskSession := &sessionWithLock{Session: s}
 
-	taskCtx, taskID, item, err := bq.registerTask(ctx, e.info, taskSession)
+	var (
+		taskCtx context.Context
+		taskID  uint64
+		item    *brieQueueItem
+	)
+	// only IMPORT has this resume feature, we skip checking e.info.kind
+	if e.resumeId == 0 {
+		taskCtx, taskID, item, err = bq.registerTask(ctx, e.info, taskSession)
+	} else {
+		taskCtx, taskID, item, err = bq.prepareResumeTask(ctx, e.info, taskSession, e.resumeId)
+	}
 	if err != nil {
 		return err
 	}
@@ -571,7 +651,20 @@ func (e *BRIEExec) Next(ctx context.Context, req *chunk.Chunk) error {
 		l := lightning.New(e.importGlobalCfg)
 		e.importTaskCfg.Checkpoint.Schema += strconv.FormatUint(taskID, 10)
 		e.importTaskCfg.TikvImporter.SortedKVDir += strconv.FormatUint(taskID, 10)
-		err2 := handleBRIEError(l.RunOnce(taskCtx, e.importTaskCfg, glue, logutil.Logger(ctx)), ErrBRIEImportFailed)
+
+		err2 := func() error {
+			// For IMPORT ... RESUME <id>, we use same action like `--checkpoint-error-ignore` in tidb-lightning-ctl
+			cpdb, err := glue.OpenCheckpointsDB(taskCtx, e.importTaskCfg)
+			if err != nil {
+				return err
+			}
+			err = cpdb.IgnoreErrorCheckpoint(taskCtx, "all")
+			if err != nil {
+				return err
+			}
+			return handleBRIEError(l.RunOnce(taskCtx, e.importTaskCfg, glue, logutil.Logger(ctx)), ErrBRIEImportFailed)
+		}()
+
 		if err2 != nil {
 			e.info.lock.Lock()
 			e.info.message = err2.Error()
