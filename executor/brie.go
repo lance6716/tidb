@@ -60,6 +60,7 @@ import (
 
 const (
 	defaultImportID = "tidb_import_"
+	flushInterval   = 3 * time.Second
 )
 
 var (
@@ -624,7 +625,7 @@ func (e *BRIEExec) Next(ctx context.Context, req *chunk.Chunk) error {
 
 	// manually monitor the Killed status...
 	go func() {
-		ticker := time.NewTicker(3 * time.Second)
+		ticker := time.NewTicker(flushInterval)
 		defer ticker.Stop()
 		for {
 			select {
@@ -634,6 +635,7 @@ func (e *BRIEExec) Next(ctx context.Context, req *chunk.Chunk) error {
 					item.cancel()
 					return
 				}
+				// TODO: handle fail to flush for a minute, and cancel task context
 				glue.Flush(taskCtx, taskID)
 			case <-taskCtx.Done():
 				return
@@ -729,6 +731,10 @@ func handleBRIEError(err error, terror *terror.Error) error {
 }
 
 func (e *ShowExec) fetchShowBRIE(ctx context.Context, kind ast.BRIEKind) error {
+	err := markTimeoutTask(ctx, e.ctx.(sqlexec.SQLExecutor))
+	if err != nil {
+		return err
+	}
 	sql := fmt.Sprintf(`SELECT id, data_path, status, progress, queue_time, exec_time, finish_time, conn_id, message
 			FROM mysql.brie_tasks WHERE kind = '%s';`, kind.String())
 	rs, err := e.ctx.(sqlexec.SQLExecutor).Execute(ctx, sql)
@@ -771,6 +777,16 @@ func (e *ShowExec) fetchShowBRIE(ctx context.Context, kind ast.BRIEKind) error {
 		}
 	}
 	return nil
+}
+
+// markTimeoutTask finds tasks that failed to update mysql.brie_tasks.last_update for one minute, change them to
+// Stop status. This should be called before query mysql.brie_tasks
+func markTimeoutTask(ctx context.Context, e sqlexec.SQLExecutor) error {
+	// TODO: change canceled waiting task to stop
+	sql := `UPDATE mysql.brie_tasks SET status = 'Stop', message = 'failed to update heartbeat'
+				WHERE status IN ('Import', 'Post-process') AND last_update < NOW() - INTERVAL 1 MINUTE;`
+	_, err := e.Execute(ctx, sql)
+	return err
 }
 
 type tidbGlueSession struct {
@@ -924,7 +940,8 @@ func (gs *tidbGlueSession) Flush(ctx context.Context, taskID uint64) {
 					data_size = %d,
 					status = '%s',
 					progress = %f,
-					message = '%s'
+					message = '%s',
+					last_update = CURRENT_TIMESTAMP
 				WHERE id = %d`,
 		gs.info.execTime.String(),
 		gs.info.finishTime.String(),
