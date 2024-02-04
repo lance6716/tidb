@@ -32,3 +32,8 @@ func TestMultiStatementInTk(t *testing.T) {
 		require.Len(t, tk.Session().GetSessionVars().MemTracker.GetChildrenForTest(), 0)
 	}
 }
+
+func TestCreateMockStore(t *testing.T) {
+	// need manually check the time duration of creating mock store
+	CreateMockStore(t)
+}
